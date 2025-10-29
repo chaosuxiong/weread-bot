@@ -4,7 +4,7 @@
 
 项目信息:
     名称: WeRead Bot
-    版本: 0.2.10
+    版本: 0.3.1
     作者: funnyzak
     仓库: https://github.com/funnyzak/weread-bot
     许可: MIT License
@@ -61,7 +61,7 @@ import schedule
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-VERSION = "0.2.10"
+VERSION = "0.3.1"
 REPO = "https://github.com/funnyzak/weread-bot"
 
 
@@ -203,6 +203,14 @@ class NotificationConfig:
 
 
 @dataclass
+class HackConfig:
+    """Hack 配置"""
+    # Cookie刷新时ql属性设置
+    # 根据不同用户的环境，可能需要设置为True或False来确保cookie刷新正常工作
+    cookie_refresh_ql: bool = False
+
+
+@dataclass
 class WeReadConfig:
     """微信读书配置主类"""
     # App 基本配置
@@ -227,6 +235,7 @@ class WeReadConfig:
     notification: NotificationConfig = field(
         default_factory=NotificationConfig
     )
+    hack: HackConfig = field(default_factory=HackConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -512,6 +521,14 @@ class ConfigManager:
                 "INCLUDE_STATISTICS", True
             ),
             channels=self._load_notification_channels(config_data),
+        )
+
+        # 加载hack配置
+        config.hack = HackConfig(
+            cookie_refresh_ql=self._get_bool_config(
+                config_data, "hack.cookie_refresh_ql",
+                "HACK_COOKIE_REFRESH_QL", False
+            ),
         )
 
         # 加载调度配置
@@ -2030,6 +2047,7 @@ class CronParser:
         """将cron表达式转换为schedule调度"""
         # 简化的cron解析，支持基本格式：分 时 日 月 周
         # 例如: "0 */2 * * *" 表示每2小时执行一次
+        # 支持多时间点: "30 9,18 * * *" 表示每天9:30和18:30执行
         parts = cron_expression.strip().split()
         if len(parts) != 5:
             logging.error(f"❌ 无效的cron表达式: {cron_expression}")
@@ -2048,6 +2066,31 @@ class CronParser:
                 )
                 logging.info(f"✅ 已设置定时任务: 每{interval}小时执行一次")
                 return True
+
+            # 处理多时间点执行 (如: 30 9,18 * * *)
+            elif "," in hour and minute.isdigit():
+                hours = [h.strip() for h in hour.split(",")]
+                valid_hours = []
+                
+                for h in hours:
+                    if h.isdigit() and 0 <= int(h) <= 23:
+                        valid_hours.append(int(h))
+                    else:
+                        logging.warning(f"⚠️ 跳过无效小时: {h}")
+                
+                if valid_hours:
+                    for h in valid_hours:
+                        time_str = f"{h:02d}:{minute.zfill(2)}"
+                        schedule.every().day.at(time_str).do(
+                            lambda t=time_str: asyncio.create_task(
+                                WeReadApplication.run_single_session()
+                            )
+                        )
+                    logging.info(f"✅ 已设置定时任务: 每天{', '.join([f'{h:02d}:{minute}' for h in valid_hours])}执行")
+                    return True
+                else:
+                    logging.error(f"❌ 没有有效的小时时间点: {hour}")
+                    return False
 
             # 处理固定时间执行
             elif hour.isdigit() and minute.isdigit():
@@ -2394,7 +2437,6 @@ class WeReadSessionManager:
 
     # 微信读书API常量
     KEY = "3c5c8717f3daf09iop3423zafeqoi"
-    COOKIE_DATA = {"rq": "%2Fweb%2Fbook%2Fread"}
     READ_URL = "https://weread.qq.com/web/book/read"
     RENEW_URL = "https://weread.qq.com/web/login/renewal"
     FIX_SYNCKEY_URL = "https://weread.qq.com/web/book/chapterInfos"
@@ -2437,6 +2479,9 @@ class WeReadSessionManager:
             self.effective_reading_config
         )
         self.session_stats = ReadingSession(user_name=self.user_name)
+
+        # 动态创建cookie数据，使用配置中的ql值
+        self.cookie_data = {"rq": "%2Fweb%2Fbook%2Fread", "ql": config.hack.cookie_refresh_ql}
 
         self.headers = {}
         self.cookies = {}
@@ -2866,7 +2911,7 @@ class WeReadSessionManager:
                 self.RENEW_URL,
                 headers=self.headers,
                 cookies=self.cookies,
-                data=json.dumps(self.COOKIE_DATA, separators=(',', ':')),
+                data=json.dumps(self.cookie_data, separators=(',', ':')),
                 timeout=30
             )
 
